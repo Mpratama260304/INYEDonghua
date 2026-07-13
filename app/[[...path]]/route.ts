@@ -15,6 +15,10 @@ const SITEMAP_CANDIDATES = [
   "/sitemap_index.xml",
   "/wp-sitemap.xml",
 ];
+// Halaman statis inti yang selalu masuk sitemap.
+const STATIC_PATHS = ["/", "/ongoing", "/completed", "/schedule"];
+// Bagian listing yang memiliki pagination `/<section>/page/N`.
+const LISTING_SECTIONS = ["ongoing", "completed"] as const;
 
 export const dynamic = "force-dynamic";
 
@@ -298,43 +302,161 @@ function robots(publicUrl: URL) {
   );
 }
 
-async function sitemap(request: Request, publicUrl: URL) {
+async function fetchOriginText(request: Request, path: string) {
+  try {
+    const response = await fetch(new URL(path, ORIGIN), {
+      headers: {
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5",
+        "user-agent": request.headers.get("user-agent") || "SEO-Mirror-Sites/1.0",
+        "accept-encoding": "identity",
+      },
+    });
+    if (!response.ok) return null;
+    return await response.text();
+  } catch {
+    return null;
+  }
+}
+
+function extractPaths(html: string, prefix: string) {
+  const found = new Set<string>();
+  const pattern = /href\s*=\s*["'](\/[^"'#?\s]*)["']/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(html)) !== null) {
+    const path = match[1];
+    if (path.startsWith(prefix)) found.add(path);
+  }
+  return [...found];
+}
+
+function lastPageNumber(html: string, base: string) {
+  const pattern = new RegExp(`/${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/page/(\\d+)`, "gi");
+  let max = 1;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(html)) !== null) {
+    max = Math.max(max, Number(match[1]));
+  }
+  return max;
+}
+
+function absoluteLoc(path: string, publicUrl: URL) {
+  return htmlEscape(new URL(path, publicUrl.origin).toString());
+}
+
+function urlsetXml(paths: Iterable<string>, publicUrl: URL) {
+  const lastmod = new Date().toISOString();
+  const entries = [...new Set(paths)]
+    .map((path) => `<url><loc>${absoluteLoc(path, publicUrl)}</loc><lastmod>${lastmod}</lastmod><changefreq>daily</changefreq></url>`)
+    .join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${entries}</urlset>`;
+}
+
+function sitemapIndexXml(paths: Iterable<string>, publicUrl: URL) {
+  const lastmod = new Date().toISOString();
+  const entries = [...new Set(paths)]
+    .map((path) => `<sitemap><loc>${absoluteLoc(path, publicUrl)}</loc><lastmod>${lastmod}</lastmod></sitemap>`)
+    .join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${entries}</sitemapindex>`;
+}
+
+function xmlResponse(body: string, source: string, maxAge: number) {
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "application/xml; charset=utf-8",
+      "cache-control": `public, max-age=${maxAge}`,
+      "x-sitemap-source": source,
+    },
+  });
+}
+
+async function upstreamSitemap(request: Request, publicUrl: URL) {
   for (const path of SITEMAP_CANDIDATES) {
-    try {
-      const response = await fetch(new URL(path, ORIGIN), {
-        headers: {
-          accept: "application/xml,text/xml;q=0.9,*/*;q=0.5",
-          "user-agent": request.headers.get("user-agent") || "SEO-Mirror-Sites/1.0",
-        },
-      });
-      if (!response.ok) continue;
-      const source = await response.text();
-      if (!/<(?:urlset|sitemapindex)(?:\s|>)/i.test(source)) continue;
-      return new Response(rewritePublicReferences(source, publicUrl), {
-        status: 200,
-        headers: {
-          "content-type": "application/xml; charset=utf-8",
-          "cache-control": "public, max-age=900",
-          "x-sitemap-source": path,
-        },
-      });
-    } catch {
-      // Coba kandidat berikutnya.
+    const source = await fetchOriginText(request, path);
+    if (!source) continue;
+    if (!/<(?:urlset|sitemapindex)(?:\s|>)/i.test(source)) continue;
+    return xmlResponse(rewritePublicReferences(source, publicUrl), `upstream:${path}`, 900);
+  }
+  return null;
+}
+
+async function sitemapIndex(request: Request, publicUrl: URL) {
+  const passthrough = await upstreamSitemap(request, publicUrl);
+  if (passthrough) return passthrough;
+
+  const children = ["/sitemap-pages.xml", "/sitemap-series.xml"];
+  for (const section of LISTING_SECTIONS) {
+    const html = await fetchOriginText(request, `/${section}`);
+    const pages = html ? lastPageNumber(html, section) : 1;
+    for (let page = 1; page <= pages; page++) {
+      // Query diurutkan (page lalu section) agar cocok dengan normalisasi URL dan menghindari redirect.
+      children.push(`/sitemap-episodes.xml?page=${page}&section=${section}`);
+    }
+  }
+  return xmlResponse(sitemapIndexXml(children, publicUrl), "generated-index", 900);
+}
+
+async function sitemapPages(request: Request, publicUrl: URL) {
+  const paths = new Set<string>(STATIC_PATHS);
+
+  const home = await fetchOriginText(request, "/");
+  const genres = home
+    ? extractPaths(home, "/genres/").filter((path) => /^\/genres\/[^/]+$/.test(path))
+    : [];
+  for (const genre of genres) paths.add(genre);
+
+  for (const genre of genres) {
+    const html = await fetchOriginText(request, genre);
+    if (!html) continue;
+    const pages = lastPageNumber(html, genre.slice(1));
+    for (let page = 2; page <= pages; page++) paths.add(`${genre}/page/${page}`);
+  }
+
+  return xmlResponse(urlsetXml(paths, publicUrl), "generated-pages", 3600);
+}
+
+async function sitemapSeries(request: Request, publicUrl: URL) {
+  const series = new Set<string>();
+
+  for (const section of LISTING_SECTIONS) {
+    const first = await fetchOriginText(request, `/${section}`);
+    if (!first) continue;
+    for (const path of extractPaths(first, "/seri/")) series.add(path);
+
+    const pages = lastPageNumber(first, section);
+    for (let page = 2; page <= pages; page++) {
+      const html = await fetchOriginText(request, `/${section}/page/${page}`);
+      if (!html) continue;
+      for (const path of extractPaths(html, "/seri/")) series.add(path);
     }
   }
 
-  const homepage = htmlEscape(`${publicUrl.origin}/`);
-  return new Response(
-    `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${homepage}</loc></url></urlset>`,
-    {
-      status: 200,
-      headers: {
-        "content-type": "application/xml; charset=utf-8",
-        "cache-control": "public, max-age=300",
-        "x-sitemap-source": "fallback-homepage-only",
-      },
-    },
-  );
+  return xmlResponse(urlsetXml(series, publicUrl), "generated-series", 1800);
+}
+
+async function sitemapEpisodes(request: Request, publicUrl: URL) {
+  const section = publicUrl.searchParams.get("section") ?? "";
+  const page = Number(publicUrl.searchParams.get("page") ?? "1");
+
+  const validSection = (LISTING_SECTIONS as readonly string[]).includes(section);
+  if (!validSection || !Number.isInteger(page) || page < 1) {
+    return xmlResponse(urlsetXml([], publicUrl), "generated-episodes-invalid", 300);
+  }
+
+  const listPath = page <= 1 ? `/${section}` : `/${section}/page/${page}`;
+  const listing = await fetchOriginText(request, listPath);
+  const episodes = new Set<string>();
+
+  if (listing) {
+    for (const watch of extractPaths(listing, "/watch/")) episodes.add(watch);
+    for (const seri of extractPaths(listing, "/seri/")) {
+      const html = await fetchOriginText(request, seri);
+      if (!html) continue;
+      for (const watch of extractPaths(html, "/watch/")) episodes.add(watch);
+    }
+  }
+
+  return xmlResponse(urlsetXml(episodes, publicUrl), `generated-episodes-${section}-${page}`, 1800);
 }
 
 async function proxy(request: Request) {
@@ -358,7 +480,10 @@ async function proxy(request: Request) {
   }
 
   if (publicUrl.pathname === "/robots.txt") return robots(publicUrl);
-  if (publicUrl.pathname === "/sitemap.xml") return sitemap(request, publicUrl);
+  if (publicUrl.pathname === "/sitemap.xml") return sitemapIndex(request, publicUrl);
+  if (publicUrl.pathname === "/sitemap-pages.xml") return sitemapPages(request, publicUrl);
+  if (publicUrl.pathname === "/sitemap-series.xml") return sitemapSeries(request, publicUrl);
+  if (publicUrl.pathname === "/sitemap-episodes.xml") return sitemapEpisodes(request, publicUrl);
 
   const init: RequestInit = {
     method: request.method,
