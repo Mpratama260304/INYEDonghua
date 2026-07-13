@@ -44,6 +44,21 @@ function replaceOrigin(value: string, publicOrigin: string) {
   return output;
 }
 
+function enforcePublicHttps(value: string, publicUrl: URL) {
+  if (publicUrl.protocol !== "https:") return value;
+
+  const source = `http://${publicUrl.host}`;
+  const target = publicUrl.origin;
+  return value
+    .split(source).join(target)
+    .split(source.replaceAll("/", "\\/")).join(target.replaceAll("/", "\\/"))
+    .split(encodeURIComponent(source)).join(encodeURIComponent(target));
+}
+
+function rewritePublicReferences(value: string, publicUrl: URL) {
+  return enforcePublicHttps(replaceOrigin(value, publicUrl.origin), publicUrl);
+}
+
 function rewriteJson(value: JsonValue, publicOrigin: string): JsonValue {
   if (typeof value === "string") return replaceOrigin(value, publicOrigin);
   if (Array.isArray(value)) return value.map((item) => rewriteJson(item, publicOrigin));
@@ -140,7 +155,7 @@ function htmlEscape(value: string) {
 }
 
 function transformHtml(html: string, publicUrl: URL, status: number) {
-  let output = replaceOrigin(html, publicUrl.origin);
+  let output = rewritePublicReferences(html, publicUrl);
 
   output = output.replace(
     /<link\b(?=[^>]*\brel\s*=\s*["'][^"']*\bcanonical\b[^"']*["'])[^>]*>\s*/gi,
@@ -216,32 +231,49 @@ function upstreamUrl(publicUrl: URL) {
   return new URL(`${publicUrl.pathname}${publicUrl.search}`, ORIGIN);
 }
 
-function forwardedHeaders(request: Request) {
+function publicRequestUrl(request: Request) {
+  const url = new URL(request.url);
+  const forwardedHost = request.headers.get("x-forwarded-host")
+    ?.split(",")[0]
+    .trim();
+  const forwardedProto = request.headers.get("x-forwarded-proto")
+    ?.split(",")[0]
+    .trim()
+    .toLowerCase();
+
+  if (forwardedHost) url.host = forwardedHost;
+  if (forwardedProto === "http" || forwardedProto === "https") {
+    url.protocol = `${forwardedProto}:`;
+  }
+  return url;
+}
+
+function forwardedHeaders(request: Request, publicUrl: URL) {
   const headers = new Headers(request.headers);
   headers.delete("host");
   headers.delete("content-length");
   headers.delete("connection");
   headers.delete("cf-connecting-ip");
   headers.set("accept-encoding", "identity");
-  headers.set("x-forwarded-host", new URL(request.url).host);
-  headers.set("x-forwarded-proto", new URL(request.url).protocol.slice(0, -1));
+  headers.set("x-forwarded-host", publicUrl.host);
+  headers.set("x-forwarded-proto", publicUrl.protocol.slice(0, -1));
   return headers;
 }
 
-function responseHeaders(upstream: Response, publicOrigin: string, transformed: boolean) {
+function responseHeaders(upstream: Response, publicUrl: URL, transformed: boolean) {
   const headers = new Headers(upstream.headers);
   headers.delete("content-length");
   headers.delete("content-encoding");
   if (transformed) headers.delete("etag");
 
   const location = headers.get("location");
-  if (location) headers.set("location", replaceOrigin(location, publicOrigin));
+  if (location) headers.set("location", rewritePublicReferences(location, publicUrl));
   for (const name of ["link", "content-security-policy", "refresh"]) {
     const value = headers.get(name);
-    if (value) headers.set(name, replaceOrigin(value, publicOrigin));
+    if (value) headers.set(name, rewritePublicReferences(value, publicUrl));
   }
   if (headers.get("access-control-allow-origin") === ORIGIN.origin) {
-    headers.set("access-control-allow-origin", publicOrigin);
+    headers.set("access-control-allow-origin", publicUrl.origin);
   }
   headers.set("x-content-type-options", "nosniff");
   headers.set("referrer-policy", "strict-origin-when-cross-origin");
@@ -278,7 +310,7 @@ async function sitemap(request: Request, publicUrl: URL) {
       if (!response.ok) continue;
       const source = await response.text();
       if (!/<(?:urlset|sitemapindex)(?:\s|>)/i.test(source)) continue;
-      return new Response(replaceOrigin(source, publicUrl.origin), {
+      return new Response(rewritePublicReferences(source, publicUrl), {
         status: 200,
         headers: {
           "content-type": "application/xml; charset=utf-8",
@@ -306,7 +338,7 @@ async function sitemap(request: Request, publicUrl: URL) {
 }
 
 async function proxy(request: Request) {
-  const publicUrl = new URL(request.url);
+  const publicUrl = publicRequestUrl(request);
 
   if (publicUrl.pathname === "/healthz" || publicUrl.pathname === "/_mirror/health") {
     return Response.json({ ok: true, origin: ORIGIN.host }, {
@@ -330,7 +362,7 @@ async function proxy(request: Request) {
 
   const init: RequestInit = {
     method: request.method,
-    headers: forwardedHeaders(request),
+    headers: forwardedHeaders(request, publicUrl),
     redirect: "manual",
   };
   if (request.method !== "GET" && request.method !== "HEAD") init.body = request.body;
@@ -343,7 +375,7 @@ async function proxy(request: Request) {
       || /\.xml$/i.test(publicUrl.pathname);
     const isCss = /text\/css/i.test(contentType);
     const transformed = isHtml || isXml || isCss;
-    const headers = responseHeaders(upstream, publicUrl.origin, transformed);
+    const headers = responseHeaders(upstream, publicUrl, transformed);
 
     if (upstream.status === 404 || upstream.status === 410) {
       headers.set("x-robots-tag", "noindex, follow");
@@ -370,7 +402,7 @@ async function proxy(request: Request) {
       body = transformHtml(body, publicUrl, upstream.status);
       headers.set("content-type", "text/html; charset=utf-8");
     } else {
-      body = replaceOrigin(body, publicUrl.origin);
+      body = rewritePublicReferences(body, publicUrl);
     }
     return new Response(body, {
       status: upstream.status,
